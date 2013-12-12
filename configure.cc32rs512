@@ -1,0 +1,59 @@
+#!/bin/sh
+
+# Minimal config for CC32RS512 emulator.
+
+$(dirname $0)/configure \
+  --target-list=arm-softmmu \
+  --audio-drv-list=        \
+  --disable-debug-tcg      \
+  --disable-debug-info     \
+  --disable-sparse         \
+  --disable-strip          \
+  --disable-werror         \
+  --disable-sdl            \
+  --disable-gtk            \
+  --disable-virtfs         \
+  --disable-vnc            \
+  --disable-cocoa          \
+  --disable-xen            \
+  --disable-xen-pci-passthrough \
+  --disable-brlapi         \
+  --disable-vnc-tls        \
+  --disable-vnc-sasl       \
+  --disable-vnc-jpeg       \
+  --disable-vnc-png        \
+  --disable-vnc-ws         \
+  --disable-curses         \
+  --disable-curl           \
+  --disable-bluez          \
+  --disable-slirp          \
+  --disable-kvm            \
+  --disable-rdma           \
+  --disable-user           \
+  --disable-linux-user     \
+  --disable-bsd-user       \
+  --disable-guest-base     \
+  --disable-pie            \
+  --disable-uuid           \
+  --disable-vde            \
+  --disable-linux-aio      \
+  --disable-cap-ng         \
+  --disable-attr           \
+  --disable-blobs          \
+  --disable-docs           \
+  --disable-vhost-net      \
+  --disable-spice          \
+  --disable-libiscsi       \
+  --disable-smartcard-nss  \
+  --disable-libusb         \
+  --disable-usb-redir      \
+  --disable-guest-agent    \
+  --disable-seccomp        \
+  --disable-coroutine-pool \
+  --disable-glusterfs      \
+  --disable-libssh2        \
+  --disable-vhdx           
+
+
+#   --disable-system         \
+#   --disable-fdt            \
