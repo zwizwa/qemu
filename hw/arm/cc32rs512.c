@@ -371,13 +371,11 @@ struct arm_boot_info cc32rs512_binfo;
 
 static void cc32rs512_init(QEMUMachineInitArgs *args)
 {
-	ARMCPU *c;
-	CPUState *env;
+	ARMCPU *cpu;
 	MemoryRegion *sysmem = get_system_memory();
 	MemoryRegion *ram = g_new(MemoryRegion, 1);
 	MemoryRegion *rsa_ram = g_new(MemoryRegion, 1);
 	MemoryRegion *flash = g_new(MemoryRegion, 1);
-	qemu_irq *cpu_irq;
 	qemu_irq pic[32];
 	DeviceState *dev;
 	cc32_flcon_state *fl;
@@ -386,8 +384,8 @@ static void cc32rs512_init(QEMUMachineInitArgs *args)
 	if (!args->cpu_model)
 		args->cpu_model = "arm926";
 
-	c = cpu_arm_init(args->cpu_model);
-	if (!c) {
+	cpu = cpu_arm_init(args->cpu_model);
+	if (!cpu) {
 		fprintf(stderr, "Unable to find CPU definition\n");
 		exit(1);
 	}
@@ -403,16 +401,14 @@ static void cc32rs512_init(QEMUMachineInitArgs *args)
 	cc32rs512_binfo.ram_size = args->ram_size;
 	cc32rs512_binfo.kernel_filename = args->kernel_filename;
 
-#if 0
-	// FIXME: IRQ stuff is different
-	cpu_irq = arm_pic_init_cpu(env);
-
-	dev = sysbus_create_varargs("cc32-sysc", 0x0F0000,
-				    cpu_irq[ARM_PIC_CPU_IRQ],
-				    cpu_irq[ARM_PIC_CPU_FIQ], NULL);
-
+	dev = DEVICE(cpu);
 	for (i = 0; i < 32; i++)
 		pic[i] = qdev_get_gpio_in(dev, i);
+
+	dev = sysbus_create_varargs("cc32-sysc", 0x0F0000,
+				pic[ARM_CPU_IRQ],
+				pic[ARM_CPU_FIQ],
+				NULL);
 
 	sysbus_create_simple("cc32-iso-slave", 0x0F8800, pic[8]);
 
@@ -426,9 +422,7 @@ static void cc32rs512_init(QEMUMachineInitArgs *args)
 	fl->ram_storage = memory_region_get_ram_ptr(ram);
 	memory_region_add_subregion(sysmem, 0, flash);
 
-#endif
-
-	arm_load_kernel(c, &cc32rs512_binfo);
+	arm_load_kernel(cpu, &cc32rs512_binfo);
 }
 
 static QEMUMachine cc32rs512_machine = {
