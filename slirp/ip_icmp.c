@@ -66,6 +66,13 @@ void icmp_init(Slirp *slirp)
     slirp->icmp_last_so = &slirp->icmp;
 }
 
+void icmp_cleanup(Slirp *slirp)
+{
+    while (slirp->icmp.so_next != &slirp->icmp) {
+        icmp_detach(slirp->icmp.so_next);
+    }
+}
+
 static int icmp_send(struct socket *so, struct mbuf *m, int hlen)
 {
     struct ip *ip = mtod(m, struct ip *);
@@ -345,7 +352,7 @@ icmp_error(struct mbuf *msrc, u_char type, u_char code, int minsize,
 
   ip->ip_ttl = MAXTTL;
   ip->ip_p = IPPROTO_ICMP;
-  ip->ip_dst = ip->ip_src;    /* ip adresses */
+  ip->ip_dst = ip->ip_src;    /* ip addresses */
   ip->ip_src = m->slirp->vhost_addr;
 
   (void ) ip_output((struct socket *)NULL, m);

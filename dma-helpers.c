@@ -7,16 +7,44 @@
  * (GNU GPL), version 2 or later.
  */
 
-#include "dma.h"
-#include "block_int.h"
+#include "sysemu/dma.h"
 #include "trace.h"
+#include "qemu/range.h"
+#include "qemu/thread.h"
+#include "qemu/main-loop.h"
 
-void qemu_sglist_init(QEMUSGList *qsg, int alloc_hint)
+/* #define DEBUG_IOMMU */
+
+int dma_memory_set(AddressSpace *as, dma_addr_t addr, uint8_t c, dma_addr_t len)
+{
+    dma_barrier(as, DMA_DIRECTION_FROM_DEVICE);
+
+#define FILLBUF_SIZE 512
+    uint8_t fillbuf[FILLBUF_SIZE];
+    int l;
+    bool error = false;
+
+    memset(fillbuf, c, FILLBUF_SIZE);
+    while (len > 0) {
+        l = len < FILLBUF_SIZE ? len : FILLBUF_SIZE;
+        error |= address_space_rw(as, addr, fillbuf, l, true);
+        len -= l;
+        addr += l;
+    }
+
+    return error;
+}
+
+void qemu_sglist_init(QEMUSGList *qsg, DeviceState *dev, int alloc_hint,
+                      AddressSpace *as)
 {
     qsg->sg = g_malloc(alloc_hint * sizeof(ScatterGatherEntry));
     qsg->nsg = 0;
     qsg->nalloc = alloc_hint;
     qsg->size = 0;
+    qsg->as = as;
+    qsg->dev = dev;
+    object_ref(OBJECT(dev));
 }
 
 void qemu_sglist_add(QEMUSGList *qsg, dma_addr_t base, dma_addr_t len)
@@ -33,7 +61,9 @@ void qemu_sglist_add(QEMUSGList *qsg, dma_addr_t base, dma_addr_t len)
 
 void qemu_sglist_destroy(QEMUSGList *qsg)
 {
+    object_unref(OBJECT(qsg->dev));
     g_free(qsg->sg);
+    memset(qsg, 0, sizeof(*qsg));
 }
 
 typedef struct {
@@ -42,7 +72,7 @@ typedef struct {
     BlockDriverAIOCB *acb;
     QEMUSGList *sg;
     uint64_t sector_num;
-    bool to_dev;
+    DMADirection dir;
     bool in_cancel;
     int sg_cur_index;
     dma_addr_t sg_cur_byte;
@@ -75,9 +105,9 @@ static void dma_bdrv_unmap(DMAAIOCB *dbs)
     int i;
 
     for (i = 0; i < dbs->iov.niov; ++i) {
-        cpu_physical_memory_unmap(dbs->iov.iov[i].iov_base,
-                                  dbs->iov.iov[i].iov_len, !dbs->to_dev,
-                                  dbs->iov.iov[i].iov_len);
+        dma_memory_unmap(dbs->sg->as, dbs->iov.iov[i].iov_base,
+                         dbs->iov.iov[i].iov_len, dbs->dir,
+                         dbs->iov.iov[i].iov_len);
     }
     qemu_iovec_reset(&dbs->iov);
 }
@@ -106,7 +136,7 @@ static void dma_complete(DMAAIOCB *dbs, int ret)
 static void dma_bdrv_cb(void *opaque, int ret)
 {
     DMAAIOCB *dbs = (DMAAIOCB *)opaque;
-    target_phys_addr_t cur_addr, cur_len;
+    dma_addr_t cur_addr, cur_len;
     void *mem;
 
     trace_dma_bdrv_cb(dbs, ret);
@@ -123,7 +153,7 @@ static void dma_bdrv_cb(void *opaque, int ret)
     while (dbs->sg_cur_index < dbs->sg->nsg) {
         cur_addr = dbs->sg->sg[dbs->sg_cur_index].base + dbs->sg_cur_byte;
         cur_len = dbs->sg->sg[dbs->sg_cur_index].len - dbs->sg_cur_byte;
-        mem = cpu_physical_memory_map(cur_addr, &cur_len, !dbs->to_dev);
+        mem = dma_memory_map(dbs->sg->as, cur_addr, &cur_len, dbs->dir);
         if (!mem)
             break;
         qemu_iovec_add(&dbs->iov, mem, cur_len);
@@ -162,7 +192,7 @@ static void dma_aio_cancel(BlockDriverAIOCB *acb)
     dma_complete(dbs, 0);
 }
 
-static AIOPool dma_aio_pool = {
+static const AIOCBInfo dma_aiocb_info = {
     .aiocb_size         = sizeof(DMAAIOCB),
     .cancel             = dma_aio_cancel,
 };
@@ -170,11 +200,11 @@ static AIOPool dma_aio_pool = {
 BlockDriverAIOCB *dma_bdrv_io(
     BlockDriverState *bs, QEMUSGList *sg, uint64_t sector_num,
     DMAIOFunc *io_func, BlockDriverCompletionFunc *cb,
-    void *opaque, bool to_dev)
+    void *opaque, DMADirection dir)
 {
-    DMAAIOCB *dbs = qemu_aio_get(&dma_aio_pool, bs, cb, opaque);
+    DMAAIOCB *dbs = qemu_aio_get(&dma_aiocb_info, bs, cb, opaque);
 
-    trace_dma_bdrv_io(dbs, bs, sector_num, to_dev);
+    trace_dma_bdrv_io(dbs, bs, sector_num, (dir == DMA_DIRECTION_TO_DEVICE));
 
     dbs->acb = NULL;
     dbs->bs = bs;
@@ -182,7 +212,7 @@ BlockDriverAIOCB *dma_bdrv_io(
     dbs->sector_num = sector_num;
     dbs->sg_cur_index = 0;
     dbs->sg_cur_byte = 0;
-    dbs->to_dev = to_dev;
+    dbs->dir = dir;
     dbs->io_func = io_func;
     dbs->bh = NULL;
     qemu_iovec_init(&dbs->iov, sg->nsg);
@@ -195,18 +225,21 @@ BlockDriverAIOCB *dma_bdrv_read(BlockDriverState *bs,
                                 QEMUSGList *sg, uint64_t sector,
                                 void (*cb)(void *opaque, int ret), void *opaque)
 {
-    return dma_bdrv_io(bs, sg, sector, bdrv_aio_readv, cb, opaque, false);
+    return dma_bdrv_io(bs, sg, sector, bdrv_aio_readv, cb, opaque,
+                       DMA_DIRECTION_FROM_DEVICE);
 }
 
 BlockDriverAIOCB *dma_bdrv_write(BlockDriverState *bs,
                                  QEMUSGList *sg, uint64_t sector,
                                  void (*cb)(void *opaque, int ret), void *opaque)
 {
-    return dma_bdrv_io(bs, sg, sector, bdrv_aio_writev, cb, opaque, true);
+    return dma_bdrv_io(bs, sg, sector, bdrv_aio_writev, cb, opaque,
+                       DMA_DIRECTION_TO_DEVICE);
 }
 
 
-static uint64_t dma_buf_rw(uint8_t *ptr, int32_t len, QEMUSGList *sg, bool to_dev)
+static uint64_t dma_buf_rw(uint8_t *ptr, int32_t len, QEMUSGList *sg,
+                           DMADirection dir)
 {
     uint64_t resid;
     int sg_cur_index;
@@ -217,7 +250,7 @@ static uint64_t dma_buf_rw(uint8_t *ptr, int32_t len, QEMUSGList *sg, bool to_de
     while (len > 0) {
         ScatterGatherEntry entry = sg->sg[sg_cur_index++];
         int32_t xfer = MIN(len, entry.len);
-        cpu_physical_memory_rw(entry.base, ptr, xfer, !to_dev);
+        dma_memory_rw(sg->as, entry.base, ptr, xfer, dir);
         ptr += xfer;
         len -= xfer;
         resid -= xfer;
@@ -228,12 +261,12 @@ static uint64_t dma_buf_rw(uint8_t *ptr, int32_t len, QEMUSGList *sg, bool to_de
 
 uint64_t dma_buf_read(uint8_t *ptr, int32_t len, QEMUSGList *sg)
 {
-    return dma_buf_rw(ptr, len, sg, 0);
+    return dma_buf_rw(ptr, len, sg, DMA_DIRECTION_FROM_DEVICE);
 }
 
 uint64_t dma_buf_write(uint8_t *ptr, int32_t len, QEMUSGList *sg)
 {
-    return dma_buf_rw(ptr, len, sg, 1);
+    return dma_buf_rw(ptr, len, sg, DMA_DIRECTION_TO_DEVICE);
 }
 
 void dma_acct_start(BlockDriverState *bs, BlockAcctCookie *cookie,

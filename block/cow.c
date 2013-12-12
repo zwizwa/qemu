@@ -22,8 +22,8 @@
  * THE SOFTWARE.
  */
 #include "qemu-common.h"
-#include "block_int.h"
-#include "module.h"
+#include "block/block_int.h"
+#include "qemu/module.h"
 
 /**************************************************************/
 /* COW block driver using file system holes */
@@ -58,7 +58,8 @@ static int cow_probe(const uint8_t *buf, int buf_size, const char *filename)
         return 0;
 }
 
-static int cow_open(BlockDriverState *bs, int flags)
+static int cow_open(BlockDriverState *bs, QDict *options, int flags,
+                    Error **errp)
 {
     BDRVCowState *s = bs->opaque;
     struct cow_header_v2 cow_header;
@@ -73,7 +74,7 @@ static int cow_open(BlockDriverState *bs, int flags)
     }
 
     if (be32_to_cpu(cow_header.magic) != COW_MAGIC) {
-        ret = -EINVAL;
+        ret = -EMEDIUMTYPE;
         goto fail;
     }
 
@@ -102,42 +103,45 @@ static int cow_open(BlockDriverState *bs, int flags)
     return ret;
 }
 
-/*
- * XXX(hch): right now these functions are extremely ineffcient.
- * We should just read the whole bitmap we'll need in one go instead.
- */
-static inline int cow_set_bit(BlockDriverState *bs, int64_t bitnum)
+static inline void cow_set_bits(uint8_t *bitmap, int start, int64_t nb_sectors)
 {
-    uint64_t offset = sizeof(struct cow_header_v2) + bitnum / 8;
-    uint8_t bitmap;
-    int ret;
-
-    ret = bdrv_pread(bs->file, offset, &bitmap, sizeof(bitmap));
-    if (ret < 0) {
-       return ret;
+    int64_t bitnum = start, last = start + nb_sectors;
+    while (bitnum < last) {
+        if ((bitnum & 7) == 0 && bitnum + 8 <= last) {
+            bitmap[bitnum / 8] = 0xFF;
+            bitnum += 8;
+            continue;
+        }
+        bitmap[bitnum/8] |= (1 << (bitnum % 8));
+        bitnum++;
     }
-
-    bitmap |= (1 << (bitnum % 8));
-
-    ret = bdrv_pwrite_sync(bs->file, offset, &bitmap, sizeof(bitmap));
-    if (ret < 0) {
-       return ret;
-    }
-    return 0;
 }
 
-static inline int is_bit_set(BlockDriverState *bs, int64_t bitnum)
+#define BITS_PER_BITMAP_SECTOR (512 * 8)
+
+/* Cannot use bitmap.c on big-endian machines.  */
+static int cow_test_bit(int64_t bitnum, const uint8_t *bitmap)
 {
-    uint64_t offset = sizeof(struct cow_header_v2) + bitnum / 8;
-    uint8_t bitmap;
-    int ret;
+    return (bitmap[bitnum / 8] & (1 << (bitnum & 7))) != 0;
+}
 
-    ret = bdrv_pread(bs->file, offset, &bitmap, sizeof(bitmap));
-    if (ret < 0) {
-       return ret;
+static int cow_find_streak(const uint8_t *bitmap, int value, int start, int nb_sectors)
+{
+    int streak_value = value ? 0xFF : 0;
+    int last = MIN(start + nb_sectors, BITS_PER_BITMAP_SECTOR);
+    int bitnum = start;
+    while (bitnum < last) {
+        if ((bitnum & 7) == 0 && bitmap[bitnum / 8] == streak_value) {
+            bitnum += 8;
+            continue;
+        }
+        if (cow_test_bit(bitnum, bitmap) == value) {
+            bitnum++;
+            continue;
+        }
+        break;
     }
-
-    return !!(bitmap & (1 << (bitnum % 8)));
+    return MIN(bitnum, last) - start;
 }
 
 /* Return true if first block has been changed (ie. current version is
@@ -146,40 +150,100 @@ static inline int is_bit_set(BlockDriverState *bs, int64_t bitnum)
 static int coroutine_fn cow_co_is_allocated(BlockDriverState *bs,
         int64_t sector_num, int nb_sectors, int *num_same)
 {
-    int changed;
+    int64_t bitnum = sector_num + sizeof(struct cow_header_v2) * 8;
+    uint64_t offset = (bitnum / 8) & -BDRV_SECTOR_SIZE;
+    bool first = true;
+    int changed = 0, same = 0;
 
-    if (nb_sectors == 0) {
-	*num_same = nb_sectors;
-	return 0;
-    }
+    do {
+        int ret;
+        uint8_t bitmap[BDRV_SECTOR_SIZE];
 
-    changed = is_bit_set(bs, sector_num);
-    if (changed < 0) {
-        return 0; /* XXX: how to return I/O errors? */
-    }
+        bitnum &= BITS_PER_BITMAP_SECTOR - 1;
+        int sector_bits = MIN(nb_sectors, BITS_PER_BITMAP_SECTOR - bitnum);
 
-    for (*num_same = 1; *num_same < nb_sectors; (*num_same)++) {
-	if (is_bit_set(bs, sector_num + *num_same) != changed)
-	    break;
-    }
+        ret = bdrv_pread(bs->file, offset, &bitmap, sizeof(bitmap));
+        if (ret < 0) {
+            return ret;
+        }
 
+        if (first) {
+            changed = cow_test_bit(bitnum, bitmap);
+            first = false;
+        }
+
+        same += cow_find_streak(bitmap, changed, bitnum, nb_sectors);
+
+        bitnum += sector_bits;
+        nb_sectors -= sector_bits;
+        offset += BDRV_SECTOR_SIZE;
+    } while (nb_sectors);
+
+    *num_same = same;
     return changed;
+}
+
+static int64_t coroutine_fn cow_co_get_block_status(BlockDriverState *bs,
+        int64_t sector_num, int nb_sectors, int *num_same)
+{
+    BDRVCowState *s = bs->opaque;
+    int ret = cow_co_is_allocated(bs, sector_num, nb_sectors, num_same);
+    int64_t offset = s->cow_sectors_offset + (sector_num << BDRV_SECTOR_BITS);
+    if (ret < 0) {
+        return ret;
+    }
+    return (ret ? BDRV_BLOCK_DATA : 0) | offset | BDRV_BLOCK_OFFSET_VALID;
 }
 
 static int cow_update_bitmap(BlockDriverState *bs, int64_t sector_num,
         int nb_sectors)
 {
-    int error = 0;
-    int i;
+    int64_t bitnum = sector_num + sizeof(struct cow_header_v2) * 8;
+    uint64_t offset = (bitnum / 8) & -BDRV_SECTOR_SIZE;
+    bool first = true;
+    int sector_bits;
 
-    for (i = 0; i < nb_sectors; i++) {
-        error = cow_set_bit(bs, sector_num + i);
-        if (error) {
-            break;
+    for ( ; nb_sectors;
+            bitnum += sector_bits,
+            nb_sectors -= sector_bits,
+            offset += BDRV_SECTOR_SIZE) {
+        int ret, set;
+        uint8_t bitmap[BDRV_SECTOR_SIZE];
+
+        bitnum &= BITS_PER_BITMAP_SECTOR - 1;
+        sector_bits = MIN(nb_sectors, BITS_PER_BITMAP_SECTOR - bitnum);
+
+        ret = bdrv_pread(bs->file, offset, &bitmap, sizeof(bitmap));
+        if (ret < 0) {
+            return ret;
+        }
+
+        /* Skip over any already set bits */
+        set = cow_find_streak(bitmap, 1, bitnum, sector_bits);
+        bitnum += set;
+        sector_bits -= set;
+        nb_sectors -= set;
+        if (!sector_bits) {
+            continue;
+        }
+
+        if (first) {
+            ret = bdrv_flush(bs->file);
+            if (ret < 0) {
+                return ret;
+            }
+            first = false;
+        }
+
+        cow_set_bits(bitmap, bitnum, sector_bits);
+
+        ret = bdrv_pwrite(bs->file, offset, &bitmap, sizeof(bitmap));
+        if (ret < 0) {
+            return ret;
         }
     }
 
-    return error;
+    return 0;
 }
 
 static int coroutine_fn cow_read(BlockDriverState *bs, int64_t sector_num,
@@ -189,7 +253,11 @@ static int coroutine_fn cow_read(BlockDriverState *bs, int64_t sector_num,
     int ret, n;
 
     while (nb_sectors > 0) {
-        if (bdrv_co_is_allocated(bs, sector_num, nb_sectors, &n)) {
+        ret = cow_co_is_allocated(bs, sector_num, nb_sectors, &n);
+        if (ret < 0) {
+            return ret;
+        }
+        if (ret) {
             ret = bdrv_pread(bs->file,
                         s->cow_sectors_offset + sector_num * 512,
                         buf, n * 512);
@@ -255,12 +323,14 @@ static void cow_close(BlockDriverState *bs)
 {
 }
 
-static int cow_create(const char *filename, QEMUOptionParameter *options)
+static int cow_create(const char *filename, QEMUOptionParameter *options,
+                      Error **errp)
 {
     struct cow_header_v2 cow_header;
     struct stat st;
     int64_t image_sectors = 0;
     const char *image_filename = NULL;
+    Error *local_err = NULL;
     int ret;
     BlockDriverState *cow_bs;
 
@@ -274,13 +344,17 @@ static int cow_create(const char *filename, QEMUOptionParameter *options)
         options++;
     }
 
-    ret = bdrv_create_file(filename, options);
+    ret = bdrv_create_file(filename, options, &local_err);
     if (ret < 0) {
+        qerror_report_err(local_err);
+        error_free(local_err);
         return ret;
     }
 
-    ret = bdrv_file_open(&cow_bs, filename, BDRV_O_RDWR);
+    ret = bdrv_file_open(&cow_bs, filename, NULL, BDRV_O_RDWR, &local_err);
     if (ret < 0) {
+        qerror_report_err(local_err);
+        error_free(local_err);
         return ret;
     }
 
@@ -314,13 +388,8 @@ static int cow_create(const char *filename, QEMUOptionParameter *options)
     }
 
 exit:
-    bdrv_delete(cow_bs);
+    bdrv_unref(cow_bs);
     return ret;
-}
-
-static coroutine_fn int cow_co_flush(BlockDriverState *bs)
-{
-    return bdrv_co_flush(bs->file);
 }
 
 static QEMUOptionParameter cow_create_options[] = {
@@ -345,11 +414,11 @@ static BlockDriver bdrv_cow = {
     .bdrv_open      = cow_open,
     .bdrv_close     = cow_close,
     .bdrv_create    = cow_create,
+    .bdrv_has_zero_init     = bdrv_has_zero_init_1,
 
     .bdrv_read              = cow_co_read,
     .bdrv_write             = cow_co_write,
-    .bdrv_co_flush_to_disk  = cow_co_flush,
-    .bdrv_co_is_allocated   = cow_co_is_allocated,
+    .bdrv_co_get_block_status   = cow_co_get_block_status,
 
     .create_options = cow_create_options,
 };

@@ -23,7 +23,7 @@
  */
 
 #include "qemu-common.h"
-#include "block_int.h"
+#include "block/block_int.h"
 #include "block/qcow2.h"
 
 typedef struct QEMU_PACKED QCowSnapshotHeader {
@@ -48,6 +48,7 @@ typedef struct QEMU_PACKED QCowSnapshotHeader {
 
 typedef struct QEMU_PACKED QCowSnapshotExtraData {
     uint64_t vm_state_size_large;
+    uint64_t disk_size;
 } QCowSnapshotExtraData;
 
 void qcow2_free_snapshots(BlockDriverState *bs)
@@ -117,6 +118,12 @@ int qcow2_read_snapshots(BlockDriverState *bs)
             sn->vm_state_size = be64_to_cpu(extra.vm_state_size_large);
         }
 
+        if (extra_data_size >= 16) {
+            sn->disk_size = be64_to_cpu(extra.disk_size);
+        } else {
+            sn->disk_size = bs->total_sectors * BDRV_SECTOR_SIZE;
+        }
+
         /* Read snapshot ID */
         sn->id_str = g_malloc(id_str_size + 1);
         ret = bdrv_pread(bs->file, offset, sn->id_str, id_str_size);
@@ -173,11 +180,23 @@ static int qcow2_write_snapshots(BlockDriverState *bs)
 
     /* Allocate space for the new snapshot list */
     snapshots_offset = qcow2_alloc_clusters(bs, snapshots_size);
-    bdrv_flush(bs->file);
     offset = snapshots_offset;
     if (offset < 0) {
-        return offset;
+        ret = offset;
+        goto fail;
     }
+    ret = bdrv_flush(bs);
+    if (ret < 0) {
+        goto fail;
+    }
+
+    /* The snapshot list position has not yet been updated, so these clusters
+     * must indeed be completely free */
+    ret = qcow2_pre_write_overlap_check(bs, 0, offset, snapshots_size);
+    if (ret < 0) {
+        goto fail;
+    }
+
 
     /* Write all snapshots to the new list */
     for(i = 0; i < s->nb_snapshots; i++) {
@@ -197,9 +216,11 @@ static int qcow2_write_snapshots(BlockDriverState *bs)
 
         memset(&extra, 0, sizeof(extra));
         extra.vm_state_size_large = cpu_to_be64(sn->vm_state_size);
+        extra.disk_size = cpu_to_be64(sn->disk_size);
 
         id_str_size = strlen(sn->id_str);
         name_size = strlen(sn->name);
+        assert(id_str_size <= UINT16_MAX && name_size <= UINT16_MAX);
         h.id_str_size = cpu_to_be16(id_str_size);
         h.name_size = cpu_to_be16(name_size);
         offset = align_offset(offset, 8);
@@ -251,12 +272,17 @@ static int qcow2_write_snapshots(BlockDriverState *bs)
     }
 
     /* free the old snapshot table */
-    qcow2_free_clusters(bs, s->snapshots_offset, s->snapshots_size);
+    qcow2_free_clusters(bs, s->snapshots_offset, s->snapshots_size,
+                        QCOW2_DISCARD_SNAPSHOT);
     s->snapshots_offset = snapshots_offset;
     s->snapshots_size = snapshots_size;
     return 0;
 
 fail:
+    if (snapshots_offset > 0) {
+        qcow2_free_clusters(bs, snapshots_offset, snapshots_size,
+                            QCOW2_DISCARD_ALWAYS);
+    }
     return ret;
 }
 
@@ -265,7 +291,8 @@ static void find_new_snapshot_id(BlockDriverState *bs,
 {
     BDRVQcowState *s = bs->opaque;
     QCowSnapshot *sn;
-    int i, id, id_max = 0;
+    int i;
+    unsigned long id, id_max = 0;
 
     for(i = 0; i < s->nb_snapshots; i++) {
         sn = s->snapshots + i;
@@ -273,34 +300,50 @@ static void find_new_snapshot_id(BlockDriverState *bs,
         if (id > id_max)
             id_max = id;
     }
-    snprintf(id_str, id_str_size, "%d", id_max + 1);
+    snprintf(id_str, id_str_size, "%lu", id_max + 1);
 }
 
-static int find_snapshot_by_id(BlockDriverState *bs, const char *id_str)
+static int find_snapshot_by_id_and_name(BlockDriverState *bs,
+                                        const char *id,
+                                        const char *name)
 {
     BDRVQcowState *s = bs->opaque;
     int i;
 
-    for(i = 0; i < s->nb_snapshots; i++) {
-        if (!strcmp(s->snapshots[i].id_str, id_str))
-            return i;
+    if (id && name) {
+        for (i = 0; i < s->nb_snapshots; i++) {
+            if (!strcmp(s->snapshots[i].id_str, id) &&
+                !strcmp(s->snapshots[i].name, name)) {
+                return i;
+            }
+        }
+    } else if (id) {
+        for (i = 0; i < s->nb_snapshots; i++) {
+            if (!strcmp(s->snapshots[i].id_str, id)) {
+                return i;
+            }
+        }
+    } else if (name) {
+        for (i = 0; i < s->nb_snapshots; i++) {
+            if (!strcmp(s->snapshots[i].name, name)) {
+                return i;
+            }
+        }
     }
+
     return -1;
 }
 
-static int find_snapshot_by_id_or_name(BlockDriverState *bs, const char *name)
+static int find_snapshot_by_id_or_name(BlockDriverState *bs,
+                                       const char *id_or_name)
 {
-    BDRVQcowState *s = bs->opaque;
-    int i, ret;
+    int ret;
 
-    ret = find_snapshot_by_id(bs, name);
-    if (ret >= 0)
+    ret = find_snapshot_by_id_and_name(bs, id_or_name, NULL);
+    if (ret >= 0) {
         return ret;
-    for(i = 0; i < s->nb_snapshots; i++) {
-        if (!strcmp(s->snapshots[i].name, name))
-            return i;
     }
-    return -1;
+    return find_snapshot_by_id_and_name(bs, NULL, id_or_name);
 }
 
 /* if no id is provided, a new one is constructed */
@@ -322,14 +365,15 @@ int qcow2_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
     }
 
     /* Check that the ID is unique */
-    if (find_snapshot_by_id(bs, sn_info->id_str) >= 0) {
-        return -ENOENT;
+    if (find_snapshot_by_id_and_name(bs, sn_info->id_str, NULL) >= 0) {
+        return -EEXIST;
     }
 
     /* Populate sn with passed data */
     sn->id_str = g_strdup(sn_info->id_str);
     sn->name = g_strdup(sn_info->name);
 
+    sn->disk_size = bs->total_sectors * BDRV_SECTOR_SIZE;
     sn->vm_state_size = sn_info->vm_state_size;
     sn->date_sec = sn_info->date_sec;
     sn->date_nsec = sn_info->date_nsec;
@@ -348,6 +392,12 @@ int qcow2_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
     l1_table = g_malloc(s->l1_size * sizeof(uint64_t));
     for(i = 0; i < s->l1_size; i++) {
         l1_table[i] = cpu_to_be64(s->l1_table[i]);
+    }
+
+    ret = qcow2_pre_write_overlap_check(bs, 0, sn->l1_table_offset,
+                                        s->l1_size * sizeof(uint64_t));
+    if (ret < 0) {
+        goto fail;
     }
 
     ret = bdrv_pwrite(bs->file, sn->l1_table_offset, l1_table,
@@ -369,11 +419,6 @@ int qcow2_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
         goto fail;
     }
 
-    ret = bdrv_flush(bs);
-    if (ret < 0) {
-        goto fail;
-    }
-
     /* Append the new snapshot to the snapshot list */
     new_snapshot_list = g_malloc((s->nb_snapshots + 1) * sizeof(QCowSnapshot));
     if (s->snapshots) {
@@ -388,15 +433,23 @@ int qcow2_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
     if (ret < 0) {
         g_free(s->snapshots);
         s->snapshots = old_snapshot_list;
+        s->nb_snapshots--;
         goto fail;
     }
 
     g_free(old_snapshot_list);
 
+    /* The VM state isn't needed any more in the active L1 table; in fact, it
+     * hurts by causing expensive COW for the next snapshot. */
+    qcow2_discard_clusters(bs, qcow2_vm_state_offset(s),
+                           align_offset(sn->vm_state_size, s->cluster_size)
+                                >> BDRV_SECTOR_BITS,
+                           QCOW2_DISCARD_NEVER);
+
 #ifdef DEBUG_ALLOC
     {
       BdrvCheckResult result = {0};
-      qcow2_check_refcounts(bs, &result);
+      qcow2_check_refcounts(bs, &result, 0);
     }
 #endif
     return 0;
@@ -425,6 +478,13 @@ int qcow2_snapshot_goto(BlockDriverState *bs, const char *snapshot_id)
         return -ENOENT;
     }
     sn = &s->snapshots[snapshot_index];
+
+    if (sn->disk_size != bs->total_sectors * BDRV_SECTOR_SIZE) {
+        error_report("qcow2: Loading snapshots with different disk "
+            "size is not implemented");
+        ret = -ENOTSUP;
+        goto fail;
+    }
 
     /*
      * Make sure that the current L1 table is big enough to contain the whole
@@ -456,6 +516,12 @@ int qcow2_snapshot_goto(BlockDriverState *bs, const char *snapshot_id)
 
     ret = qcow2_update_snapshot_refcount(bs, sn->l1_table_offset,
                                          sn->l1_size, 1);
+    if (ret < 0) {
+        goto fail;
+    }
+
+    ret = qcow2_pre_write_overlap_check(bs, QCOW2_OL_ACTIVE_L1,
+                                        s->l1_table_offset, cur_l1_bytes);
     if (ret < 0) {
         goto fail;
     }
@@ -506,7 +572,7 @@ int qcow2_snapshot_goto(BlockDriverState *bs, const char *snapshot_id)
 #ifdef DEBUG_ALLOC
     {
         BdrvCheckResult result = {0};
-        qcow2_check_refcounts(bs, &result);
+        qcow2_check_refcounts(bs, &result, 0);
     }
 #endif
     return 0;
@@ -516,15 +582,19 @@ fail:
     return ret;
 }
 
-int qcow2_snapshot_delete(BlockDriverState *bs, const char *snapshot_id)
+int qcow2_snapshot_delete(BlockDriverState *bs,
+                          const char *snapshot_id,
+                          const char *name,
+                          Error **errp)
 {
     BDRVQcowState *s = bs->opaque;
     QCowSnapshot sn;
     int snapshot_index, ret;
 
     /* Search the snapshot */
-    snapshot_index = find_snapshot_by_id_or_name(bs, snapshot_id);
+    snapshot_index = find_snapshot_by_id_and_name(bs, snapshot_id, name);
     if (snapshot_index < 0) {
+        error_setg(errp, "Can't find the snapshot");
         return -ENOENT;
     }
     sn = s->snapshots[snapshot_index];
@@ -536,6 +606,7 @@ int qcow2_snapshot_delete(BlockDriverState *bs, const char *snapshot_id)
     s->nb_snapshots--;
     ret = qcow2_write_snapshots(bs);
     if (ret < 0) {
+        error_setg(errp, "Failed to remove snapshot from snapshot list");
         return ret;
     }
 
@@ -553,20 +624,23 @@ int qcow2_snapshot_delete(BlockDriverState *bs, const char *snapshot_id)
     ret = qcow2_update_snapshot_refcount(bs, sn.l1_table_offset,
                                          sn.l1_size, -1);
     if (ret < 0) {
+        error_setg(errp, "Failed to free the cluster and L1 table");
         return ret;
     }
-    qcow2_free_clusters(bs, sn.l1_table_offset, sn.l1_size * sizeof(uint64_t));
+    qcow2_free_clusters(bs, sn.l1_table_offset, sn.l1_size * sizeof(uint64_t),
+                        QCOW2_DISCARD_SNAPSHOT);
 
     /* must update the copied flag on the current cluster offsets */
     ret = qcow2_update_snapshot_refcount(bs, s->l1_table_offset, s->l1_size, 0);
     if (ret < 0) {
+        error_setg(errp, "Failed to update snapshot status in disk");
         return ret;
     }
 
 #ifdef DEBUG_ALLOC
     {
         BdrvCheckResult result = {0};
-        qcow2_check_refcounts(bs, &result);
+        qcow2_check_refcounts(bs, &result, 0);
     }
 #endif
     return 0;
@@ -601,7 +675,10 @@ int qcow2_snapshot_list(BlockDriverState *bs, QEMUSnapshotInfo **psn_tab)
     return s->nb_snapshots;
 }
 
-int qcow2_snapshot_load_tmp(BlockDriverState *bs, const char *snapshot_name)
+int qcow2_snapshot_load_tmp(BlockDriverState *bs,
+                            const char *snapshot_id,
+                            const char *name,
+                            Error **errp)
 {
     int i, snapshot_index;
     BDRVQcowState *s = bs->opaque;
@@ -613,8 +690,10 @@ int qcow2_snapshot_load_tmp(BlockDriverState *bs, const char *snapshot_name)
     assert(bs->read_only);
 
     /* Search the snapshot */
-    snapshot_index = find_snapshot_by_id_or_name(bs, snapshot_name);
+    snapshot_index = find_snapshot_by_id_and_name(bs, snapshot_id, name);
     if (snapshot_index < 0) {
+        error_setg(errp,
+                   "Can't find snapshot");
         return -ENOENT;
     }
     sn = &s->snapshots[snapshot_index];
@@ -625,6 +704,7 @@ int qcow2_snapshot_load_tmp(BlockDriverState *bs, const char *snapshot_name)
 
     ret = bdrv_pread(bs->file, sn->l1_table_offset, new_l1_table, new_l1_bytes);
     if (ret < 0) {
+        error_setg(errp, "Failed to read l1 table for snapshot");
         g_free(new_l1_table);
         return ret;
     }

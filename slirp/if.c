@@ -6,7 +6,7 @@
  */
 
 #include <slirp.h>
-#include "qemu-timer.h"
+#include "qemu/timer.h"
 
 static void
 ifs_insque(struct mbuf *ifm, struct mbuf *ifmhead)
@@ -96,8 +96,13 @@ if_output(struct socket *so, struct mbuf *ifm)
 			ifs_insque(ifm, ifq->ifs_prev);
 			goto diddit;
 		}
-	} else
+        } else {
 		ifq = slirp->if_batchq.ifq_prev;
+                /* Set next_m if the queue was empty so far */
+                if (slirp->next_m == &slirp->if_batchq) {
+                    slirp->next_m = ifm;
+                }
+        }
 
 	/* Create a new doubly linked list for this session */
 	ifm->ifq_so = so;
@@ -105,8 +110,6 @@ if_output(struct socket *so, struct mbuf *ifm)
 	insque(ifm, ifq);
 
 diddit:
-	slirp->if_queued++;
-
 	if (so) {
 		/* Update *_queued */
 		so->so_queued++;
@@ -139,7 +142,7 @@ diddit:
 
 /*
  * Send a packet
- * We choose a packet based on it's position in the output queues;
+ * We choose a packet based on its position in the output queues;
  * If there are packets on the fastq, they are sent FIFO, before
  * everything else.  Otherwise we choose the first packet from the
  * batchq and send it.  the next packet chosen will be from the session
@@ -151,45 +154,50 @@ diddit:
  */
 void if_start(Slirp *slirp)
 {
-    uint64_t now = qemu_get_clock_ns(rt_clock);
-    int requeued = 0;
-    bool from_batchq = false;
-    struct mbuf *ifm, *ifqt;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    bool from_batchq, next_from_batchq;
+    struct mbuf *ifm, *ifm_next, *ifqt;
 
     DEBUG_CALL("if_start");
 
-    while (slirp->if_queued) {
-        /* check if we can really output */
-        if (!slirp_can_output(slirp->opaque))
-            return;
+    if (slirp->if_start_busy) {
+        return;
+    }
+    slirp->if_start_busy = true;
 
-        /*
-         * See which queue to get next packet from
-         * If there's something in the fastq, select it immediately
-         */
-        if (slirp->if_fastq.ifq_next != &slirp->if_fastq) {
-            ifm = slirp->if_fastq.ifq_next;
-        } else {
-            /* Nothing on fastq, see if next_m is valid */
-            if (slirp->next_m != &slirp->if_batchq) {
-                ifm = slirp->next_m;
-            } else {
-                ifm = slirp->if_batchq.ifq_next;
-            }
+    if (slirp->if_fastq.ifq_next != &slirp->if_fastq) {
+        ifm_next = slirp->if_fastq.ifq_next;
+        next_from_batchq = false;
+    } else if (slirp->next_m != &slirp->if_batchq) {
+        /* Nothing on fastq, pick up from batchq via next_m */
+        ifm_next = slirp->next_m;
+        next_from_batchq = true;
+    } else {
+        ifm_next = NULL;
+    }
 
-            from_batchq = true;
+    while (ifm_next) {
+        ifm = ifm_next;
+        from_batchq = next_from_batchq;
+
+        ifm_next = ifm->ifq_next;
+        if (ifm_next == &slirp->if_fastq) {
+            /* No more packets in fastq, switch to batchq */
+            ifm_next = slirp->next_m;
+            next_from_batchq = true;
         }
-
-        slirp->if_queued--;
+        if (ifm_next == &slirp->if_batchq) {
+            /* end of batchq */
+            ifm_next = NULL;
+        }
 
         /* Try to send packet unless it already expired */
         if (ifm->expiration_date >= now && !if_encap(slirp, ifm)) {
             /* Packet is delayed due to pending ARP resolution */
-            requeued++;
             continue;
         }
 
-        if (from_batchq) {
+        if (ifm == slirp->next_m) {
             /* Set which packet to send on next iteration */
             slirp->next_m = ifm->ifq_next;
         }
@@ -200,8 +208,20 @@ void if_start(Slirp *slirp)
 
         /* If there are more packets for this session, re-queue them */
         if (ifm->ifs_next != ifm) {
-            insque(ifm->ifs_next, ifqt);
+            struct mbuf *next = ifm->ifs_next;
+
+            insque(next, ifqt);
             ifs_remque(ifm);
+
+            if (!from_batchq) {
+                /* Next packet in fastq is from the same session */
+                ifm_next = next;
+                next_from_batchq = false;
+            } else if (slirp->next_m == &slirp->if_batchq) {
+                /* Set next_m and ifm_next if the session packet is now the
+                 * only one on batchq */
+                slirp->next_m = ifm_next = next;
+            }
         }
 
         /* Update so_queued */
@@ -211,8 +231,7 @@ void if_start(Slirp *slirp)
         }
 
         m_free(ifm);
-
     }
 
-    slirp->if_queued = requeued;
+    slirp->if_start_busy = false;
 }

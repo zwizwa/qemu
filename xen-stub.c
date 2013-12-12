@@ -9,8 +9,9 @@
  */
 
 #include "qemu-common.h"
-#include "hw/xen.h"
-#include "memory.h"
+#include "hw/xen/xen.h"
+#include "exec/memory.h"
+#include "qmp-commands.h"
 
 void xenstore_store_pv_console_info(int i, CharDriverState *chr)
 {
@@ -26,6 +27,10 @@ void xen_piix3_set_irq(void *opaque, int irq_num, int level)
 }
 
 void xen_piix_pci_write_config_client(uint32_t address, uint32_t val, int len)
+{
+}
+
+void xen_hvm_inject_msi(uint64_t addr, uint32_t data)
 {
 }
 
@@ -49,4 +54,17 @@ int xen_init(void)
 
 void xen_register_framebuffer(MemoryRegion *mr)
 {
+}
+
+void qmp_xen_set_global_dirty_log(bool enable, Error **errp)
+{
+}
+
+void xen_modified_memory(ram_addr_t start, ram_addr_t length)
+{
+}
+
+int xen_hvm_init(MemoryRegion **ram_memory)
+{
+    return 0;
 }
