@@ -17,11 +17,14 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "hw.h"
-#include "sysbus.h"
+#include "hw/hw.h"
+#include "hw/sysbus.h"
 #include "trace.h"
-#include "qemu-char.h"
-#include "qemu-error.h"
+#include "sysemu/char.h"
+#include "qemu/error-report.h"
+
+// Not sure what these should be
+#define FIXME_OWNER NULL
 
 enum iso_slave_reg {
 	ISOCON		= 0x00,
@@ -76,7 +79,7 @@ static void iso_slave_update_irq(CC32IsoSlaveState *s)
 	qemu_set_irq(s->irq, irq);
 }
 
-static uint64_t iso_slave_read(void *opaque, target_phys_addr_t addr, unsigned size)
+static uint64_t iso_slave_read(void *opaque, hwaddr addr, unsigned size)
 {
 	CC32IsoSlaveState *s = opaque;
 	uint32_t r;
@@ -99,7 +102,7 @@ static uint64_t iso_slave_read(void *opaque, target_phys_addr_t addr, unsigned s
 	return r;
 }
 
-static void iso_slave_write(void *opaque, target_phys_addr_t addr,
+static void iso_slave_write(void *opaque, hwaddr addr,
 			uint64_t value, unsigned size)
 {
 	CC32IsoSlaveState *s = opaque;
@@ -222,7 +225,7 @@ static void iso_slave_event(void *opaque, int event)
 
 static void iso_slave_reset(DeviceState *d)
 {
-	CC32IsoSlaveState *s = container_of(d, CC32IsoSlaveState, busdev.qdev);
+	CC32IsoSlaveState *s = container_of(d, CC32IsoSlaveState, busdev.parent_obj);
 	int i;
 
 	for (i = 0; i < NUM_REGS; i++) {
@@ -250,11 +253,11 @@ static void iso_slave_reset(DeviceState *d)
 
 static int iso_slave_init(SysBusDevice *dev)
 {
-	CC32IsoSlaveState *s = FROM_SYSBUS(typeof(*s), dev);
+	CC32IsoSlaveState *s = DO_UPCAST(typeof(*s), busdev, dev);
 
 	sysbus_init_irq(dev, &s->irq);
 
-	memory_region_init_io(&s->iomem, &iso_slave_ops, s, "iso7816_slave", 0x64);
+	memory_region_init_io(&s->iomem, FIXME_OWNER, &iso_slave_ops, s, "iso7816_slave", 0x64);
 	sysbus_init_mmio(dev, &s->iomem);
 
 	s->chr = qemu_char_get_next_serial();

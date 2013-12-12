@@ -17,11 +17,15 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "sysbus.h"
-#include "arm-misc.h"
-#include "devices.h"
-#include "boards.h"
-#include "exec-memory.h"
+#include "hw/sysbus.h"
+#include "hw/devices.h"
+#include "hw/boards.h"
+#include "hw/arm/arm.h"
+#include "exec/address-spaces.h"
+
+// Not sure what these should be
+#define FIXME_OWNER NULL
+
 
 /***********************************************************************
  * Flash controller
@@ -64,7 +68,7 @@ static void cc32_flcon_update(cc32_flcon_state *s)
 		qemu_set_irq(s->irq, 0);
 }
 
-static uint64_t cc32_flcon_read(void *opaque, target_phys_addr_t offset,
+static uint64_t cc32_flcon_read(void *opaque, hwaddr offset,
 			     unsigned size)
 {
 	cc32_flcon_state *s = (cc32_flcon_state *)opaque;
@@ -72,7 +76,7 @@ static uint64_t cc32_flcon_read(void *opaque, target_phys_addr_t offset,
 	return s->regs[offset>>2];
 }
 
-static void cc32_flcon_write(void *opaque, target_phys_addr_t offset,
+static void cc32_flcon_write(void *opaque, hwaddr offset,
 			uint64_t value, unsigned size)
 {
 	cc32_flcon_state *s = (cc32_flcon_state *)opaque;
@@ -121,7 +125,7 @@ static void cc32_flcon_write(void *opaque, target_phys_addr_t offset,
 }
 
 /* callback for user writes to the flash memory region */
-static void cc32_flash_write(void *opaque, target_phys_addr_t offset,
+static void cc32_flash_write(void *opaque, hwaddr offset,
 			uint64_t value, unsigned size)
 {
 	cc32_flcon_state *s = (cc32_flcon_state *)opaque;
@@ -140,14 +144,14 @@ static void cc32_flash_write(void *opaque, target_phys_addr_t offset,
 	switch (s->wrst) {
 	case WRST_ERASE:
 		fprintf(stderr, "cc32-flcon: Erasing %u at offset 0x%06x\n",
-			page_size, offset & mask);
+			page_size, (unsigned int)offset & mask);
 		memset(s->storage + (offset & mask), 0xFF, page_size);
 		s->regs[FLSTS>>2] |= 1;
 		s->wrst = WRST_NONE;
 		break;
 	case WRST_PROGRAM:
 		fprintf(stderr, "cc32-flcon: Programming %u at offset 0x%06x\n",
-			page_size, offset & mask);
+			page_size, (unsigned int)offset & mask);
 		memcpy(s->storage + (offset & mask),
 		       s->ram_storage + ((s->regs[FLBUF>>2] & 0xffffff) - 0xC0000),
 		       page_size);
@@ -181,11 +185,11 @@ static const MemoryRegionOps cc32_flash_ops = {
 
 static int cc32_flcon_init(SysBusDevice *dev)
 {
-	cc32_flcon_state *s = FROM_SYSBUS(cc32_flcon_state, dev);
+	cc32_flcon_state *s = DO_UPCAST(typeof(*s), busdev, dev);
 
 	sysbus_init_irq(dev, &s->irq);
 
-	memory_region_init_io(&s->iomem, &cc32_flcon_ops, s, "cc32-flcon", NUM_FL_REGS<<2);
+	memory_region_init_io(&s->iomem, FIXME_OWNER, &cc32_flcon_ops, s, "cc32-flcon", NUM_FL_REGS<<2);
 	sysbus_init_mmio(dev, &s->iomem);
 
 	return 0;
@@ -193,7 +197,7 @@ static int cc32_flcon_init(SysBusDevice *dev)
 
 static void cc32_flcon_reset(DeviceState *d)
 {
-	cc32_flcon_state *s = container_of(d, cc32_flcon_state, busdev.qdev);
+	cc32_flcon_state *s = container_of(d, cc32_flcon_state, busdev.parent_obj);
 
 	s->regs[FLBUF>>2] = 0xC0000 + (16*1024) - 512;
 }
@@ -278,7 +282,7 @@ static void cc32_sysc_set_irq(void *opaque, int irq, int level)
 	cc32_sysc_update(s);
 }
 
-static uint64_t cc32_sysc_read(void *opaque, target_phys_addr_t offset,
+static uint64_t cc32_sysc_read(void *opaque, hwaddr offset,
 			     unsigned size)
 {
 	cc32_sysc_state *s = (cc32_sysc_state *)opaque;
@@ -293,7 +297,7 @@ static uint64_t cc32_sysc_read(void *opaque, target_phys_addr_t offset,
 	return 0;
 }
 
-static void cc32_sysc_write(void *opaque, target_phys_addr_t offset,
+static void cc32_sysc_write(void *opaque, hwaddr offset,
 			uint64_t value, unsigned size)
 {
 	cc32_sysc_state *s = (cc32_sysc_state *)opaque;
@@ -314,12 +318,12 @@ static const MemoryRegionOps cc32_sysc_ops = {
 
 static int cc32_sysc_init(SysBusDevice *dev)
 {
-	cc32_sysc_state *s = FROM_SYSBUS(cc32_sysc_state, dev);
+	cc32_sysc_state *s = DO_UPCAST(typeof(*s), busdev, dev);
 
-	qdev_init_gpio_in(&dev->qdev, cc32_sysc_set_irq, 32);
+	qdev_init_gpio_in(&dev->parent_obj, cc32_sysc_set_irq, 32);
 	sysbus_init_irq(dev, &s->parent_irq);
 	sysbus_init_irq(dev, &s->parent_fiq);
-	memory_region_init_io(&s->iomem, &cc32_sysc_ops, s, "cc32-sysc", NUM_REGS<<2);
+	memory_region_init_io(&s->iomem, FIXME_OWNER, &cc32_sysc_ops, s, "cc32-sysc", NUM_REGS<<2);
 	sysbus_init_mmio(dev, &s->iomem);
 
 	return 0;
@@ -327,7 +331,7 @@ static int cc32_sysc_init(SysBusDevice *dev)
 
 static void cc32_sysc_reset(DeviceState *d)
 {
-	cc32_sysc_state *s = container_of(d, cc32_sysc_state, busdev.qdev);
+	cc32_sysc_state *s = container_of(d, cc32_sysc_state, busdev.parent_obj);
 
 	s->irq_enabled = 0xFFFEF7FF;
 	/* FIXME */
@@ -365,11 +369,9 @@ type_init(cc32_register_types)
 
 struct arm_boot_info cc32rs512_binfo;
 
-static void cc32rs512_init(ram_addr_t ram_size,
-		const char *boot_device,
-		const char *kernel_filename, const char *kernel_cmdline,
-		const char *initrd_filename, const char *cpu_model)
+static void cc32rs512_init(QEMUMachineInitArgs *args)
 {
+	ARMCPU *c;
 	CPUState *env;
 	MemoryRegion *sysmem = get_system_memory();
 	MemoryRegion *ram = g_new(MemoryRegion, 1);
@@ -381,26 +383,30 @@ static void cc32rs512_init(ram_addr_t ram_size,
 	cc32_flcon_state *fl;
 	int i;
 
-	if (!cpu_model)
-		cpu_model = "arm926";
-	env = cpu_init(cpu_model);
-	if (!env) {
+	if (!args->cpu_model)
+		args->cpu_model = "arm926";
+
+	c = cpu_arm_init(args->cpu_model);
+	if (!c) {
 		fprintf(stderr, "Unable to find CPU definition\n");
 		exit(1);
 	}
 
-	memory_region_init_ram(ram, "cc32rs512.ram", 16*1024);
+	memory_region_init_ram(ram, FIXME_OWNER, "cc32rs512.ram", 16*1024);
 	vmstate_register_ram_global(ram);
 	memory_region_add_subregion(sysmem, 0xc0000, ram);
 
-	memory_region_init_ram(rsa_ram, "cc32rs512.rsa_ram", 2*1024);
+	memory_region_init_ram(rsa_ram, FIXME_OWNER, "cc32rs512.rsa_ram", 2*1024);
 	vmstate_register_ram_global(rsa_ram);
 	memory_region_add_subregion(sysmem, 0xd4000, rsa_ram);
 
-	cc32rs512_binfo.ram_size = ram_size;
-	cc32rs512_binfo.kernel_filename = kernel_filename;
+	cc32rs512_binfo.ram_size = args->ram_size;
+	cc32rs512_binfo.kernel_filename = args->kernel_filename;
 
+#if 0
+	// FIXME: IRQ stuff is different
 	cpu_irq = arm_pic_init_cpu(env);
+
 	dev = sysbus_create_varargs("cc32-sysc", 0x0F0000,
 				    cpu_irq[ARM_PIC_CPU_IRQ],
 				    cpu_irq[ARM_PIC_CPU_FIQ], NULL);
@@ -411,15 +417,18 @@ static void cc32rs512_init(ram_addr_t ram_size,
 	sysbus_create_simple("cc32-iso-slave", 0x0F8800, pic[8]);
 
 	dev = sysbus_create_simple("cc32-flcon", 0x0F2000, pic[6]);
-	fl = container_of(dev, cc32_flcon_state, busdev.qdev);
-	memory_region_init_rom_device(flash, &cc32_flash_ops, fl,
+
+	fl = container_of(dev, cc32_flcon_state, busdev.parent_obj);
+	memory_region_init_rom_device(flash, FIXME_OWNER, &cc32_flash_ops, fl,
 					"cc32rs512.flash", 512*1024);
 	vmstate_register_ram_global(flash);
 	fl->storage = memory_region_get_ram_ptr(flash);
 	fl->ram_storage = memory_region_get_ram_ptr(ram);
 	memory_region_add_subregion(sysmem, 0, flash);
 
-	arm_load_kernel(env, &cc32rs512_binfo);
+#endif
+
+	arm_load_kernel(c, &cc32rs512_binfo);
 }
 
 static QEMUMachine cc32rs512_machine = {
