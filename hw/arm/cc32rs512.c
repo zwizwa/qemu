@@ -377,7 +377,7 @@ static void cc32rs512_init(QEMUMachineInitArgs *args)
 	MemoryRegion *rsa_ram = g_new(MemoryRegion, 1);
 	MemoryRegion *flash = g_new(MemoryRegion, 1);
 	qemu_irq pic[32];
-	DeviceState *dev;
+	DeviceState *sysc_dev, *flash_dev;
 	cc32_flcon_state *fl;
 	int i;
 
@@ -401,20 +401,20 @@ static void cc32rs512_init(QEMUMachineInitArgs *args)
 	cc32rs512_binfo.ram_size = args->ram_size;
 	cc32rs512_binfo.kernel_filename = args->kernel_filename;
 
-	dev = DEVICE(cpu);
-	for (i = 0; i < 32; i++)
-		pic[i] = qdev_get_gpio_in(dev, i);
 
-	dev = sysbus_create_varargs("cc32-sysc", 0x0F0000,
-				pic[ARM_CPU_IRQ],
-				pic[ARM_CPU_FIQ],
+	sysc_dev = sysbus_create_varargs("cc32-sysc", 0x0F0000,
+				qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ),
+				qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_FIQ),
 				NULL);
+
+	for (i = 0; i < 32; i++)
+		pic[i] = qdev_get_gpio_in(sysc_dev, i);
 
 	sysbus_create_simple("cc32-iso-slave", 0x0F8800, pic[8]);
 
-	dev = sysbus_create_simple("cc32-flcon", 0x0F2000, pic[6]);
+	flash_dev = sysbus_create_simple("cc32-flcon", 0x0F2000, pic[6]);
 
-	fl = container_of(dev, cc32_flcon_state, busdev.parent_obj);
+	fl = container_of(flash_dev, cc32_flcon_state, busdev.parent_obj);
 	memory_region_init_rom_device(flash, FIXME_OWNER, &cc32_flash_ops, fl,
 					"cc32rs512.flash", 512*1024);
 	vmstate_register_ram_global(flash);
