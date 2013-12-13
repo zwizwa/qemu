@@ -239,6 +239,10 @@ enum cc32_sysc_reg {
 	SCGLEV		= 0x64,
 	SCWUT		= 0x68,
 	SCCM4		= 0x7C,
+
+	/* For quick & dirty debug & test. */
+	TEST_PUTC	= 0x80,
+	TEST_EXIT	= 0x84,
 };
 
 #define NUM_REGS	((SCCM4>>2) + 4)
@@ -306,7 +310,14 @@ static void cc32_sysc_write(void *opaque, hwaddr offset,
 		s->irq_enabled = value;
 		fprintf(stderr, "cc32-sysc: INTEN = 0x%08x\n", s->irq_enabled);
 		break;
+	case TEST_PUTC:
+		putc(value, stderr);
+		break;
+	case TEST_EXIT:
+		exit(value);
+		break;
 	}
+
 	cc32_sysc_update(s);
 }
 
